@@ -13,6 +13,7 @@ from collections import deque
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image, ImageStat, ImageFilter, ImageEnhance, ImageOps
+import sys
 
 app = Flask(__name__)
 CORS(app)
@@ -647,3 +648,5 @@ def health_check():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=True, threaded=True) 
+
+    print("Using Python version:", sys.version)
