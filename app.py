@@ -14,6 +14,15 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from PIL import Image, ImageStat, ImageFilter, ImageEnhance, ImageOps
 import sys
+import gc
+
+# Try to import psutil for memory monitoring, but make it optional
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("Warning: psutil not available. Memory monitoring will be limited.")
 
 app = Flask(__name__)
 CORS(app)
@@ -46,6 +55,12 @@ user_attention_data = {}
 
 user_calibration = {}
 
+# Memory management settings
+MAX_USERS = 1000  # Maximum number of users to track
+MAX_HISTORY_ENTRIES = 20  # Reduced from 30 to save memory
+CLEANUP_INTERVAL = 300  # Cleanup every 5 minutes
+last_cleanup_time = time.time()
+
 ATTENTIVE = "attentive"
 LOOKING_AWAY = "looking_away"
 ABSENT = "absent"
@@ -55,6 +70,61 @@ SLEEPING = "sleeping"
 DARKNESS = "darkness"
 
 processing_lock = threading.Lock()
+
+def cleanup_old_data():
+    """Clean up old user data to prevent memory leaks"""
+    global user_attention_data, user_calibration, last_cleanup_time
+    
+    current_time = time.time()
+    if current_time - last_cleanup_time < CLEANUP_INTERVAL:
+        return
+    
+    last_cleanup_time = current_time
+    
+    # Remove users who haven't been active for more than 10 minutes
+    cutoff_time = current_time - 600  # 10 minutes
+    users_to_remove = []
+    
+    for user_id, user_data in user_attention_data.items():
+        last_activity = user_data.get("last_activity", 0)
+        if last_activity < cutoff_time:
+            users_to_remove.append(user_id)
+    
+    # Remove old users
+    for user_id in users_to_remove:
+        del user_attention_data[user_id]
+        if user_id in user_calibration:
+            del user_calibration[user_id]
+    
+    # If still too many users, remove oldest ones
+    if len(user_attention_data) > MAX_USERS:
+        sorted_users = sorted(
+            user_attention_data.items(),
+            key=lambda x: x[1].get("last_activity", 0)
+        )
+        users_to_remove = [user_id for user_id, _ in sorted_users[:-MAX_USERS]]
+        
+        for user_id in users_to_remove:
+            del user_attention_data[user_id]
+            if user_id in user_calibration:
+                del user_calibration[user_id]
+    
+    # Limit history entries for all users
+    for user_id in user_attention_data:
+        if "history" in user_attention_data[user_id] and len(user_attention_data[user_id]["history"]) > MAX_HISTORY_ENTRIES:
+            user_attention_data[user_id]["history"] = user_attention_data[user_id]["history"][-MAX_HISTORY_ENTRIES:]
+        
+        # Limit measurements history
+        if "measurements" in user_attention_data[user_id]:
+            measurements = user_attention_data[user_id]["measurements"]
+            if hasattr(measurements, '__len__') and len(measurements) > 10:
+                user_attention_data[user_id]["measurements"] = list(measurements)[-10:]
+    
+    # Force garbage collection
+    gc.collect()
+    
+    if users_to_remove:
+        print(f"Cleaned up {len(users_to_remove)} inactive users. Current users: {len(user_attention_data)}")
 
 def decode_base64_image(base64_string):
     if "base64," in base64_string:
@@ -339,7 +409,8 @@ def detect_attention(pil_image, cv_image, user_id):
         user_attention_data[user_id] = {
             'measurements': deque(maxlen=10),
             'state_history': deque(maxlen=20),
-            'calibration_images': []
+            'calibration_images': [],
+            'last_activity': time.time()
         }
         
         calibrate_user(pil_image, cv_image, user_id)
@@ -429,18 +500,24 @@ def detect_attention(pil_image, cv_image, user_id):
 def update_attention_history(user_id, attention_state):
     current_time = int(time.time() * 1000)
     
+    # Clean up old data periodically
+    cleanup_old_data()
+    
     if user_id not in user_attention_data:
         user_attention_data[user_id] = {
             "current_state": attention_state,
             "state_since": current_time,
-            "history": []
+            "history": [],
+            "last_activity": time.time()
         }
     else:
+        # Update last activity
+        user_attention_data[user_id]["last_activity"] = time.time()
+        
         if user_attention_data[user_id].get("current_state") != attention_state:
             prev_state = user_attention_data[user_id].get("current_state")
             prev_since = user_attention_data[user_id].get("state_since", current_time)
             
-          
             duration = (current_time - prev_since) / 1000.0
             
             if duration > 1:
@@ -457,8 +534,9 @@ def update_attention_history(user_id, attention_state):
             user_attention_data[user_id]["current_state"] = attention_state
             user_attention_data[user_id]["state_since"] = current_time
     
-    if "history" in user_attention_data[user_id] and len(user_attention_data[user_id]["history"]) > 30:
-        user_attention_data[user_id]["history"] = user_attention_data[user_id]["history"][-30:]
+    # Limit history entries using the new constant
+    if "history" in user_attention_data[user_id] and len(user_attention_data[user_id]["history"]) > MAX_HISTORY_ENTRIES:
+        user_attention_data[user_id]["history"] = user_attention_data[user_id]["history"][-MAX_HISTORY_ENTRIES:]
     
     return user_attention_data[user_id]
 
@@ -639,10 +717,33 @@ def api_room_attention():
 @app.route('/api/health', methods=['GET'])
 def health_check():
     current_timestamp = int(time.time() * 1000)
+    
+    # Get memory usage
+    if PSUTIL_AVAILABLE:
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / 1024 / 1024
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Get memory after GC
+        memory_after_gc = process.memory_info().rss / 1024 / 1024
+    else:
+        memory_mb = 0
+        memory_after_gc = 0
+        # Force garbage collection even without psutil
+        gc.collect()
+    
     return jsonify({
         'status': 'ok', 
         'timestamp': current_timestamp,
-        'users_tracked': len(user_attention_data)
+        'users_tracked': len(user_attention_data),
+        'memory_usage_mb': round(memory_mb, 2) if PSUTIL_AVAILABLE else 'psutil_not_available',
+        'memory_after_gc_mb': round(memory_after_gc, 2) if PSUTIL_AVAILABLE else 'psutil_not_available',
+        'calibration_users': len(user_calibration),
+        'last_cleanup': last_cleanup_time,
+        'psutil_available': PSUTIL_AVAILABLE
     })
 
 if __name__ == '__main__':
