@@ -3,6 +3,7 @@ import time
 import sys
 import gc
 import traceback
+import requests
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
@@ -19,6 +20,20 @@ from models import AttentionResponse, RoomAttentionResponse, CalibrationResponse
 
 app = Flask(__name__)
 CORS(app)
+
+def send_log_to_server(log_data):
+    """Send attention log to Node.js server"""
+    try:
+        node_server_url = os.environ.get('NODE_SERVER_URL', 'http://localhost:3001')
+        response = requests.post(
+            f"{node_server_url}/api/logs/attention",
+            json=log_data,
+            timeout=5
+        )
+        if response.status_code != 201:
+            print(f"Warning: Failed to send log to server. Status: {response.status_code}")
+    except Exception as e:
+        print(f"Error sending log to server: {str(e)}")
 
 @app.route('/api/detect_attention', methods=['POST'])
 def api_detect_attention():
@@ -42,6 +57,24 @@ def api_detect_attention():
             attention_category = "inactive"
         
         result['attentionCategory'] = attention_category
+        
+        # Send log to Node.js server if meeting data is provided
+        if 'meetingId' in data and 'sessionId' in data and 'roomId' in data:
+            log_data = {
+                'meetingId': data['meetingId'],
+                'userId': user_id,
+                'userName': data.get('userName', 'Anonymous'),
+                'attentionState': result['attentionState'],
+                'attentionPercentage': result['attentionPercentage'],
+                'confidence': result['confidence'],
+                'measurements': result.get('measurements', {}),
+                'sessionId': data['sessionId'],
+                'roomId': data['roomId']
+            }
+            
+            # Send log asynchronously
+            import threading
+            threading.Thread(target=send_log_to_server, args=(log_data,)).start()
         
         return jsonify(result)
     

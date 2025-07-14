@@ -2,12 +2,13 @@ import time
 import threading
 from collections import deque
 from models import (
-    ATTENTIVE, LOOKING_AWAY, ABSENT, ACTIVE, DROWSY, DARKNESS,
+    ATTENTIVE, LOOKING_AWAY, ABSENT, DROWSY, SLEEPING, DARKNESS,
     UserAttentionData, UserCalibration
 )
 from analysis import (
     analyze_image_brightness, analyze_image_contrast,
-    analyze_face_present, analyze_eye_area, analyze_head_position
+    analyze_face_present, analyze_eye_area, analyze_head_position,
+    analyze_drowsiness, detect_sleeping_state, detect_face_mesh_mediapipe
 )
 from utils import (
     get_user_attention_data, get_user_calibration, set_user_calibration,
@@ -35,7 +36,7 @@ def calibrate_user(pil_image, cv_image, user_id):
     return False
 
 def detect_attention(pil_image, cv_image, user_id):
-    """Main attention detection function"""
+    """Main attention detection function with enhanced detection"""
     user_data = get_user_attention_data(user_id)
     
     if user_id not in user_data:
@@ -59,7 +60,17 @@ def detect_attention(pil_image, cv_image, user_id):
     face_presence = analyze_face_present(pil_image, cv_image)
     eye_openness = analyze_eye_area(pil_image, cv_image)
     looking_score = analyze_head_position(pil_image, cv_image)
+    drowsiness_score = analyze_drowsiness(pil_image, cv_image)
     contrast = analyze_image_contrast(pil_image)
+    
+    # Enhanced sleeping detection
+    face_mesh_results = detect_face_mesh_mediapipe(cv_image)
+    is_sleeping = False
+    sleeping_score = 0.0
+    
+    if face_mesh_results.multi_face_landmarks:
+        face_landmarks = face_mesh_results.multi_face_landmarks[0]
+        is_sleeping, sleeping_score = detect_sleeping_state(face_landmarks, cv_image.shape, eye_openness)
     
     measurement = {
         'brightness': brightness,
@@ -67,6 +78,8 @@ def detect_attention(pil_image, cv_image, user_id):
         'face_presence': face_presence,
         'eye_openness': eye_openness,
         'looking_score': looking_score,
+        'drowsiness_score': drowsiness_score,
+        'sleeping_score': sleeping_score,
         'timestamp': time.time()
     }
     
@@ -76,47 +89,52 @@ def detect_attention(pil_image, cv_image, user_id):
     print(f"  Face presence: {face_presence:.2f}")
     print(f"  Eye openness: {eye_openness:.2f}")
     print(f"  Looking score: {looking_score:.2f}")
+    print(f"  Drowsiness score: {drowsiness_score:.2f}")
+    print(f"  Sleeping score: {sleeping_score:.2f}")
     print(f"  Contrast: {contrast:.2f}")
     
-    # IMMEDIATE STATE DETECTION - No weighted averages
-    # Use current snapshot values directly for immediate response
+    # ENHANCED STATE DETECTION with improved thresholds
     
-    # Immediate absence detection
+    # 1. DARKNESS: Very low brightness
+    if brightness < 15:
+        print(f"DEBUG - User {user_id} - Detected DARKNESS (brightness < 15)")
+        user_data[user_id]['state_history'].append(DARKNESS)
+        return DARKNESS
+    
+    # 2. ABSENT: No face detected
     if face_presence < 8:
         print(f"DEBUG - User {user_id} - Detected ABSENT (face_presence < 8)")
         user_data[user_id]['state_history'].append(ABSENT)
         return ABSENT
     
-
+    # 2. SLEEPING: Eyes completely closed
+    if eye_openness < 5 or sleeping_score > 0.7:
+        print(f"DEBUG - User {user_id} - Detected SLEEPING (eye_openness < 5 or sleeping_score > 0.7)")
+        user_data[user_id]['state_history'].append(SLEEPING)
+        return SLEEPING
     
-    # Immediate drowsy detection
-    if eye_openness < 12:
-        print(f"DEBUG - User {user_id} - Detected DROWSY (eye_openness < 12)")
+    # 3. DROWSY: Eyes partially closed
+    if eye_openness < 20 or drowsiness_score > 50:
+        print(f"DEBUG - User {user_id} - Detected DROWSY (eye_openness < 20 or drowsiness_score > 50)")
         user_data[user_id]['state_history'].append(DROWSY)
         return DROWSY
     
-    # Immediate looking away detection
+    # 4. LOOKING_AWAY: Head tilted or turned
     if looking_score < 0.6:
         print(f"DEBUG - User {user_id} - Detected LOOKING_AWAY (looking_score < 0.6)")
         user_data[user_id]['state_history'].append(LOOKING_AWAY)
         return LOOKING_AWAY
     
-    # Immediate attentive detection - high standards for immediate response
-    if face_presence > 25 and eye_openness > 25 and looking_score > 0.85:
+    # Enhanced attentive detection - high standards for immediate response
+    if (face_presence > 30 and eye_openness > 30 and looking_score > 0.8 and drowsiness_score < 30):
         print(f"DEBUG - User {user_id} - Detected ATTENTIVE (all high conditions met)")
         user_data[user_id]['state_history'].append(ATTENTIVE)
         return ATTENTIVE
     
-    # Immediate active detection - moderate standards
-    if face_presence > 15 and eye_openness > 15 and looking_score > 0.7:
-        print(f"DEBUG - User {user_id} - Detected ACTIVE (moderate conditions met)")
-        user_data[user_id]['state_history'].append(ACTIVE)
-        return ACTIVE
-    
-    # Default to absent if no clear state detected
-    print(f"DEBUG - User {user_id} - Detected ABSENT (default case)")
-    user_data[user_id]['state_history'].append(ABSENT)
-    return ABSENT
+    # Default to looking away if no clear state detected
+    print(f"DEBUG - User {user_id} - Detected LOOKING_AWAY (default case)")
+    user_data[user_id]['state_history'].append(LOOKING_AWAY)
+    return LOOKING_AWAY
 
 def process_attention_request(pil_image, cv_image, user_id):
     """Process attention detection request with thread safety"""
@@ -129,13 +147,12 @@ def process_attention_request(pil_image, cv_image, user_id):
         
         if attention_state == ATTENTIVE:
             attention_percentage = 95  # High attention
-        elif attention_state == ACTIVE:
-            attention_percentage = 75  # Moderate attention
         elif attention_state == LOOKING_AWAY:
             attention_percentage = 40  # Low attention
         elif attention_state == DROWSY:
             attention_percentage = 25  # Very low attention
-
+        elif attention_state == SLEEPING:
+            attention_percentage = 5   # Minimal attention (sleeping)
         elif attention_state == ABSENT:
             attention_percentage = 0   # No attention
         elif attention_state == DARKNESS:
@@ -153,13 +170,28 @@ def process_attention_request(pil_image, cv_image, user_id):
             user_id
         )
         
+        # Get current measurements for logging
+        current_measurements = {}
+        if 'measurements' in user_data and user_data['measurements']:
+            latest_measurement = user_data['measurements'][-1]
+            current_measurements = {
+                'brightness': latest_measurement.get('brightness', 0),
+                'contrast': latest_measurement.get('contrast', 0),
+                'facePresence': latest_measurement.get('face_presence', 0),
+                'eyeOpenness': latest_measurement.get('eye_openness', 0),
+                'lookingScore': latest_measurement.get('looking_score', 0),
+                'drowsinessScore': latest_measurement.get('drowsiness_score', 0),
+                'sleepingScore': latest_measurement.get('sleeping_score', 0)
+            }
+        
         return {
             'userId': user_id,
             'attentionState': attention_state,
             'stateSince': user_data.get("state_since", current_timestamp),
             'attentionPercentage': attention_percentage,
             'confidence': round(confidence * 100, 1),
-            'timestamp': current_timestamp
+            'timestamp': current_timestamp,
+            'measurements': current_measurements
         }
 
 def get_room_attention_data(room_id, user_ids):
@@ -177,13 +209,12 @@ def get_room_attention_data(room_id, user_ids):
             
             if current_state == ATTENTIVE:
                 attention_percentage = 95  # High attention
-            elif current_state == ACTIVE:
-                attention_percentage = 75  # Moderate attention
             elif current_state == LOOKING_AWAY:
                 attention_percentage = 40  # Low attention
             elif current_state == DROWSY:
                 attention_percentage = 25  # Very low attention
-
+            elif current_state == SLEEPING:
+                attention_percentage = 5   # Minimal attention (sleeping)
             elif current_state == ABSENT:
                 attention_percentage = 0   # No attention
             elif current_state == DARKNESS:
@@ -200,7 +231,9 @@ def get_room_attention_data(room_id, user_ids):
             )
 
             attention_category = "attentive"
-            if current_state in [LOOKING_AWAY, DROWSY]:
+            if current_state == SLEEPING:
+                attention_category = "sleeping"
+            elif current_state in [LOOKING_AWAY, DROWSY]:
                 attention_category = "distracted"
             elif current_state in [ABSENT, DARKNESS]:
                 attention_category = "inactive"
